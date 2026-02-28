@@ -7,3 +7,6 @@ __pycache__/
 .coverage
 htmlcov/
 .DS_Store
+data/
+*.h5
+*.pkl
