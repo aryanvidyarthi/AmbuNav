@@ -1,0 +1,35 @@
+# Core
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.11.0
+networkx>=3.2.0
+
+# Deep Learning / Forecasting (Graph WaveNet)
+torch>=2.1.0
+torch-geometric>=2.4.0
+
+# Routing and optimization
+heapdict>=1.0.1
+
+# UI
+streamlit>=1.31.0
+plotly>=5.18.0
+folium>=0.15.0
+streamlit-folium>=0.18.0
+
+# Config and utilities
+pyyaml>=6.0.1
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+
+# Experimentation and logging
+tqdm>=4.66.0
+tensorboard>=2.15.0
+
+# Development and testing
+pytest>=8.0.0
+pytest-cov>=4.1.0
+black>=24.1.0
+isort>=5.13.0
+flake8>=7.0.0
+mypy>=1.8.0
