@@ -19,6 +19,7 @@ from src.data.traffic_dataset import TrafficDataset
 from src.evaluation.routing_distribution import evaluate_random_od_pairs
 from src.inference import run_inference
 from src.models.graph_wavenet import GraphWaveNet
+from src.routing.dynamic_astar import load_node_uncertainty
 
 
 @st.cache_resource(show_spinner=False)
@@ -113,9 +114,20 @@ def _reliability_text(mae: float) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def compute_routing_distribution_metrics(n_pairs: int = 100, seed: int = 42) -> dict[str, float | list[float]]:
+def compute_routing_distribution_metrics(
+    n_pairs: int = 100,
+    seed: int = 42,
+    lambda_value: float = 0.3,
+) -> dict[str, float | list[float]]:
     predicted_speeds = np.asarray(run_inference(), dtype=np.float32)
-    return evaluate_random_od_pairs(predicted_speeds=predicted_speeds, n_pairs=n_pairs, seed=seed)
+    node_uncertainty = load_node_uncertainty(PROJECT_ROOT / "node_uncertainty.npy")
+    return evaluate_random_od_pairs(
+        predicted_speeds=predicted_speeds,
+        node_uncertainty=node_uncertainty,
+        lambda_value=lambda_value,
+        n_pairs=n_pairs,
+        seed=seed,
+    )
 
 
 def _inject_analysis_styles() -> None:
@@ -177,9 +189,9 @@ def _inject_analysis_styles() -> None:
 
 def render_analysis_page() -> None:
     _inject_analysis_styles()
-    st.markdown('<div class="fa-title">📊 Forecasting Analysis</div>', unsafe_allow_html=True)
+    st.markdown('<div class="fa-title">\U0001F4CA Forecasting Analysis</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="fa-subtitle">⏱ Horizon-wise evaluation of GraphWaveNet on the test split using the existing checkpoint.</div>',
+        '<div class="fa-subtitle">\u23F1 Horizon-wise evaluation of GraphWaveNet on the test split using the existing checkpoint.</div>',
         unsafe_allow_html=True,
     )
 
@@ -203,7 +215,7 @@ def render_analysis_page() -> None:
             )
         results_df = pd.DataFrame(rows)
 
-        st.markdown("### 🚑 Confidence Interpretation", unsafe_allow_html=True)
+        st.markdown("### \U0001F691 Confidence Interpretation", unsafe_allow_html=True)
         cards = st.columns(3)
         for col, (_, row) in zip(cards, results_df.iterrows()):
             with col:
@@ -222,7 +234,7 @@ def render_analysis_page() -> None:
 
         c1, c2 = st.columns([1.15, 1.1])
         with c1:
-            st.markdown("### 📊 Metrics Table")
+            st.markdown("### \U0001F4CA Metrics Table")
             table_df = results_df[["Horizon", "MAE", "RMSE", "MAPE"]].copy()
             table_df["MAE"] = table_df["MAE"].map(lambda x: f"{x:.6f}")
             table_df["RMSE"] = table_df["RMSE"].map(lambda x: f"{x:.6f}")
@@ -230,7 +242,7 @@ def render_analysis_page() -> None:
             st.table(table_df)
 
         with c2:
-            st.markdown("### ⏱ MAE by Horizon")
+            st.markdown("### \u23F1 MAE by Horizon")
             chart_df = results_df.copy()
             chart_df["HorizonMin"] = [5, 10, 15]
             mae_chart = (
@@ -255,20 +267,22 @@ def render_analysis_page() -> None:
         )
 
         st.markdown("---")
-        st.markdown("## 📈 Statistical Routing Evaluation (100 OD Pairs)")
+        lambda_used = 0.3
+        st.markdown("## \U0001F4C8 Statistical Routing Evaluation (100 OD Pairs)")
+        st.caption(f"Uncertainty-aware routing enabled (lambda = {lambda_used:.2f})")
 
         try:
-            routing_eval = compute_routing_distribution_metrics(n_pairs=100, seed=42)
+            routing_eval = compute_routing_distribution_metrics(n_pairs=100, seed=42, lambda_value=lambda_used)
         except Exception as exc:
             st.error(f"Failed to run routing distribution evaluation: {exc}")
             return
 
-        r1, r2, r3, r4 = st.columns(4)
+        r1, r2, r3, r4, r5, r6 = st.columns(6)
         with r1:
             st.markdown(
                 (
                     '<div class="summary-card">'
-                    '<div class="summary-label">📊 Average Improvement</div>'
+                    '<div class="summary-label">\U0001F4CA Avg Improvement (Risk Cost)</div>'
                     f'<div class="summary-value">{float(routing_eval["mean"]):.2f}%</div>'
                     "</div>"
                 ),
@@ -278,7 +292,7 @@ def render_analysis_page() -> None:
             st.markdown(
                 (
                     '<div class="summary-card">'
-                    '<div class="summary-label">📈 Median Improvement</div>'
+                    '<div class="summary-label">\U0001F4C8 Median Improvement</div>'
                     f'<div class="summary-value">{float(routing_eval["median"]):.2f}%</div>'
                     "</div>"
                 ),
@@ -288,7 +302,7 @@ def render_analysis_page() -> None:
             st.markdown(
                 (
                     '<div class="summary-card">'
-                    '<div class="summary-label">🚑 % Routes Improved</div>'
+                    '<div class="summary-label">\U0001F691 % Routes Improved</div>'
                     f'<div class="summary-value">{float(routing_eval["positive_rate"]):.1f}%</div>'
                     "</div>"
                 ),
@@ -298,8 +312,28 @@ def render_analysis_page() -> None:
             st.markdown(
                 (
                     '<div class="summary-card">'
-                    '<div class="summary-label">📊 Std Deviation</div>'
+                    '<div class="summary-label">\U0001F4CA Std Deviation</div>'
                     f'<div class="summary-value">{float(routing_eval["std"]):.2f}</div>'
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+        with r5:
+            st.markdown(
+                (
+                    '<div class="summary-card">'
+                    '<div class="summary-label">\U0001F6E1 Avg Reliability</div>'
+                    f'<div class="summary-value">{float(routing_eval["avg_reliability"]):.1f}%</div>'
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+        with r6:
+            st.markdown(
+                (
+                    '<div class="summary-card">'
+                    '<div class="summary-label">\u23F3 Avg Improvement (Physical ETA)</div>'
+                    f'<div class="summary-value">{float(routing_eval["physical_mean"]):.2f}%</div>'
                     "</div>"
                 ),
                 unsafe_allow_html=True,
@@ -315,7 +349,7 @@ def render_analysis_page() -> None:
 
         p1, p2 = st.columns(2)
         with p1:
-            st.markdown("### 📊 Improvement Distribution")
+            st.markdown("### \U0001F4CA Improvement Distribution")
             hist = (
                 alt.Chart(dist_df)
                 .mark_bar(color="#43c6ff")
@@ -329,7 +363,7 @@ def render_analysis_page() -> None:
             st.altair_chart(hist, width="stretch")
 
         with p2:
-            st.markdown("### 📈 Route Index vs Improvement")
+            st.markdown("### \U0001F4C8 Route Index vs Improvement")
             line = (
                 alt.Chart(dist_df)
                 .mark_line(point=True, color="#36a3ff")
@@ -346,9 +380,9 @@ def render_analysis_page() -> None:
             st.altair_chart(line, width="stretch")
 
         if float(routing_eval["positive_rate"]) > 60.0:
-            msg = "Predictive routing consistently outperforms static routing."
+            msg = "Uncertainty-aware predictive routing consistently outperforms static routing."
         else:
-            msg = "Predictive advantage is limited under current dataset conditions."
+            msg = "Uncertainty-aware predictive advantage is limited under current dataset conditions."
         st.info(msg)
 
 
@@ -359,3 +393,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

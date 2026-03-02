@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timedelta
+import inspect
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,11 +20,7 @@ if str(PAGES_DIR) not in sys.path:
 
 from Analysis import render_analysis_page
 from src.inference import run_inference
-from src.routing.dynamic_astar import (
-    build_sensor_graph,
-    compare_static_vs_predictive,
-    load_adjacency_matrix,
-)
+from src.routing import dynamic_astar as routing_dynamic_astar
 
 
 def _inject_styles() -> None:
@@ -268,12 +264,76 @@ def _metric_card(title: str, value: str, value_color: str = "#f4f7ff") -> None:
 
 @st.cache_resource
 def _get_graph_and_layout(adj_path: str) -> tuple[nx.Graph, dict[int, tuple[float, float]]]:
-    adjacency = load_adjacency_matrix(adj_path)
-    directed_graph = build_sensor_graph(adjacency)
+    adjacency = routing_dynamic_astar.load_adjacency_matrix(adj_path)
+    directed_graph = routing_dynamic_astar.build_sensor_graph(adjacency)
     # Route search can fallback to undirected edges; draw on undirected graph to avoid broken segments.
     graph = directed_graph.to_undirected(as_view=False)
     layout = nx.spring_layout(graph, seed=42, k=0.24)
     return graph, layout
+
+
+@st.cache_resource
+def _load_normalized_uncertainty(uncertainty_path: str) -> np.ndarray:
+    if hasattr(routing_dynamic_astar, "load_node_uncertainty") and hasattr(
+        routing_dynamic_astar, "normalize_node_uncertainty"
+    ):
+        node_uncertainty = routing_dynamic_astar.load_node_uncertainty(uncertainty_path)
+        return routing_dynamic_astar.normalize_node_uncertainty(node_uncertainty)
+
+    node_uncertainty = np.asarray(np.load(uncertainty_path), dtype=np.float32).reshape(-1)
+    unc_min = float(np.min(node_uncertainty))
+    unc_max = float(np.max(node_uncertainty))
+    if np.isclose(unc_max, unc_min):
+        return np.zeros_like(node_uncertainty, dtype=np.float32)
+    normalized = (node_uncertainty - unc_min) / (unc_max - unc_min)
+    return np.clip(normalized.astype(np.float32), 0.0, 1.0)
+
+
+def _edge_risk_color(uncertainty_value: float) -> str:
+    if uncertainty_value < 0.3:
+        return "#22c55e"
+    if uncertainty_value < 0.6:
+        return "#facc15"
+    return "#ef4444"
+
+
+def _compute_route_reliability(path: list[int], node_uncertainty_norm: np.ndarray) -> tuple[float, float, str]:
+    if hasattr(routing_dynamic_astar, "compute_route_reliability"):
+        return routing_dynamic_astar.compute_route_reliability(path, node_uncertainty_norm)
+
+    if not path:
+        return 1.0, 0.0, "High"
+    path_unc = node_uncertainty_norm[np.asarray(path, dtype=np.int64)]
+    avg_unc = float(np.mean(path_unc))
+    reliability = float(np.clip(100.0 - avg_unc * 100.0, 0.0, 100.0))
+    if avg_unc < 0.3:
+        return avg_unc, reliability, "Low"
+    if avg_unc < 0.6:
+        return avg_unc, reliability, "Medium"
+    return avg_unc, reliability, "High"
+
+
+def _compare_static_vs_predictive_compat(
+    start_node: int,
+    end_node: int,
+    predicted_speeds: np.ndarray,
+    adj_path: Path,
+    node_uncertainty_norm: np.ndarray | None,
+    lambda_value: float,
+):
+    compare_fn = routing_dynamic_astar.compare_static_vs_predictive
+    params = inspect.signature(compare_fn).parameters
+    kwargs: dict[str, object] = {
+        "start_node": int(start_node),
+        "end_node": int(end_node),
+        "predicted_speeds": predicted_speeds,
+        "adj_path": adj_path,
+    }
+    if "node_uncertainty" in params:
+        kwargs["node_uncertainty"] = node_uncertainty_norm
+    if "lambda_value" in params:
+        kwargs["lambda_value"] = float(lambda_value)
+    return compare_fn(**kwargs)
 
 
 def _plot_paths(
@@ -283,20 +343,39 @@ def _plot_paths(
     predictive_path: list[int],
     start_node: int,
     end_node: int,
+    node_uncertainty_norm: np.ndarray | None = None,
+    show_risk_layer: bool = False,
 ) -> None:
     fig, ax = plt.subplots(figsize=(13, 7.5))
     fig.patch.set_facecolor("#090f1a")
     ax.set_facecolor("#090f1a")
 
-    nx.draw_networkx_edges(
-        graph,
-        pos=layout,
-        edge_color="#8fa0bf",
-        width=0.55,
-        alpha=0.16,
-        arrows=False,
-        ax=ax,
-    )
+    if show_risk_layer and node_uncertainty_norm is not None:
+        edge_list = list(graph.edges())
+        edge_colors = []
+        for u, v in edge_list:
+            unc = float((node_uncertainty_norm[u] + node_uncertainty_norm[v]) * 0.5)
+            edge_colors.append(_edge_risk_color(unc))
+        nx.draw_networkx_edges(
+            graph,
+            pos=layout,
+            edgelist=edge_list,
+            edge_color=edge_colors,
+            width=1.2,
+            alpha=0.55,
+            arrows=False,
+            ax=ax,
+        )
+    else:
+        nx.draw_networkx_edges(
+            graph,
+            pos=layout,
+            edge_color="#8fa0bf",
+            width=0.55,
+            alpha=0.16,
+            arrows=False,
+            ax=ax,
+        )
     nx.draw_networkx_nodes(
         graph,
         pos=layout,
@@ -323,7 +402,7 @@ def _plot_paths(
         graph,
         pos=layout,
         edgelist=predictive_edges,
-        edge_color="#10d876",
+        edge_color="#00f5d4",
         width=3.5,
         alpha=0.98,
         arrows=False,
@@ -353,29 +432,6 @@ def _plot_paths(
     plt.close(fig)
 
 
-def _render_live_clock() -> None:
-    components.html(
-        """
-        <div id="ambu-clock" style="text-align:center; color:#e9efff; font-weight:700;
-             font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-             font-size:0.96rem; margin-top:0.55rem;">
-          Device Time: --:--:--
-        </div>
-        <script>
-          function updateClock() {
-            const now = new Date();
-            const time = now.toLocaleTimeString([], {hour12: false});
-            const node = document.getElementById('ambu-clock');
-            if (node) node.textContent = `Device Time: ${time}`;
-          }
-          updateClock();
-          setInterval(updateClock, 1000);
-        </script>
-        """,
-        height=36,
-    )
-
-
 def _format_minutes(value_minutes: float | None) -> str:
     if value_minutes is None:
         return "--"
@@ -386,6 +442,23 @@ def _format_hhmm(dt_value: datetime | None) -> str:
     if dt_value is None:
         return "--"
     return dt_value.strftime("%H:%M")
+
+
+def _format_ampm(dt_value: datetime | None) -> str:
+    if dt_value is None:
+        return "--"
+    return dt_value.strftime("%I:%M %p").lstrip("0")
+
+
+def _format_eta_readable(minutes_value: float | None) -> str:
+    if minutes_value is None:
+        return "--"
+    scaled_minutes = int(round(float(minutes_value) * 60.0))
+    if scaled_minutes < 60:
+        return f"{scaled_minutes} min"
+    hours = scaled_minutes // 60
+    mins = scaled_minutes % 60
+    return f"{hours} hr {mins} min"
 
 
 def _node_speed_vector(predicted_speeds: np.ndarray) -> np.ndarray:
@@ -465,7 +538,8 @@ def _analytics_card(title: str, value_html: str) -> None:
 
 def _route_optimizer_page() -> None:
     adj_path = PROJECT_ROOT / "data" / "raw" / "adj_METR-LA.pkl"
-    adjacency = load_adjacency_matrix(adj_path)
+    uncertainty_path = PROJECT_ROOT / "node_uncertainty.npy"
+    adjacency = routing_dynamic_astar.load_adjacency_matrix(adj_path)
     max_node_idx = int(adjacency.shape[0] - 1)
 
     with st.sidebar:
@@ -484,16 +558,14 @@ def _route_optimizer_page() -> None:
             value=min(10, max_node_idx),
             step=1,
         )
-        travel_after_min = st.slider(
-            "Travel after (minutes)",
-            min_value=0,
-            max_value=120,
-            value=0,
-            step=5,
+        lambda_value = st.slider(
+            "Risk penalty (lambda)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.3,
+            step=0.05,
         )
-        current_device_dt = datetime.now()
-        scheduled_departure_dt = current_device_dt + timedelta(minutes=int(travel_after_min))
-        st.caption(f"Scheduled Departure: {scheduled_departure_dt.strftime('%H:%M')}")
+        show_risk_layer = st.checkbox("Show Risk Layer", value=True)
         optimize_clicked = st.button("Optimize Route", width="stretch")
 
     st.markdown(
@@ -504,128 +576,102 @@ def _route_optimizer_page() -> None:
                 <h1 class="main-title">&#128657; AmbuNav - AI Emergency Route Optimizer</h1>
             </div>
             <p class="subtitle">Real-time Predictive Traffic Intelligence for Ambulance Routing</p>
-            <span class="clock-pill">Live Device Time</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    _render_live_clock()
 
     if "route_result" not in st.session_state:
         st.session_state.route_result = {
-            "static_minutes": None,
             "predictive_minutes": None,
-            "improvement_pct": None,
             "static_path": None,
             "predictive_path": None,
+            "node_uncertainty_norm": None,
+            "reliability_score": None,
             "predicted_speeds": None,
+            "last_inputs": None,
         }
 
-    if optimize_clicked:
+    current_inputs = (int(start_node), int(end_node), round(float(lambda_value), 3))
+    has_previous_run = st.session_state.route_result["predicted_speeds"] is not None
+    params_changed = st.session_state.route_result["last_inputs"] != current_inputs
+    should_recompute = bool(optimize_clicked) or (has_previous_run and params_changed)
+
+    if should_recompute:
         try:
-            predicted_speeds = run_inference()
-            (static_path, static_time), (predictive_path, predictive_time), percentage_improvement = (
-                compare_static_vs_predictive(
-                    start_node=int(start_node),
-                    end_node=int(end_node),
-                    predicted_speeds=predicted_speeds,
-                    adj_path=adj_path,
-                )
+            if optimize_clicked or st.session_state.route_result["predicted_speeds"] is None:
+                predicted_speeds = run_inference()
+                try:
+                    node_uncertainty_norm = _load_normalized_uncertainty(str(uncertainty_path))
+                except FileNotFoundError:
+                    node_uncertainty_norm = None
+                    st.warning(
+                        "node_uncertainty.npy not found. "
+                        "Run: python src/evaluation/compute_node_uncertainty.py"
+                    )
+            else:
+                predicted_speeds = st.session_state.route_result["predicted_speeds"]
+                node_uncertainty_norm = st.session_state.route_result["node_uncertainty_norm"]
+
+            (static_path, _), (predictive_path, predictive_time), _ = _compare_static_vs_predictive_compat(
+                start_node=int(start_node),
+                end_node=int(end_node),
+                predicted_speeds=predicted_speeds,
+                node_uncertainty_norm=node_uncertainty_norm,
+                lambda_value=float(lambda_value),
+                adj_path=adj_path,
             )
 
-            # Existing backend time outputs are converted to minutes for UI display.
+            if node_uncertainty_norm is not None:
+                _, reliability_score, _ = _compute_route_reliability(predictive_path, node_uncertainty_norm)
+            else:
+                reliability_score = None
+
             st.session_state.route_result = {
-                "static_minutes": max(float(static_time) * 60.0, 0.0),
                 "predictive_minutes": max(float(predictive_time) * 60.0, 0.0),
-                "improvement_pct": float(percentage_improvement),
                 "static_path": static_path,
                 "predictive_path": predictive_path,
+                "node_uncertainty_norm": node_uncertainty_norm,
+                "reliability_score": reliability_score,
                 "predicted_speeds": predicted_speeds,
+                "last_inputs": current_inputs,
             }
-        except Exception as exc:  # pragma: no cover - UI error path
+        except Exception as exc:  # pragma: no cover
             st.error(f"Failed to optimize route: {exc}")
 
-    static_minutes = st.session_state.route_result["static_minutes"]
     predictive_minutes = st.session_state.route_result["predictive_minutes"]
-    improvement_pct = st.session_state.route_result["improvement_pct"]
     static_path = st.session_state.route_result["static_path"]
     predictive_path = st.session_state.route_result["predictive_path"]
-    predicted_speeds = st.session_state.route_result["predicted_speeds"]
+    node_uncertainty_norm = st.session_state.route_result["node_uncertainty_norm"]
+    reliability_score = st.session_state.route_result["reliability_score"]
 
-    # Time flow:
-    # device_time -> scheduled_departure (+travel_after) -> ETA (+predictive travel minutes)
-    if predictive_minutes is not None:
-        eta_dt = scheduled_departure_dt + timedelta(minutes=float(predictive_minutes))
-    else:
-        eta_dt = None
+    departure_dt = datetime.now()
+    scaled_eta_minutes = (
+        float(int(round(float(predictive_minutes) * 60.0)))
+        if predictive_minutes is not None
+        else None
+    )
+    arrival_dt = (
+        departure_dt + timedelta(minutes=scaled_eta_minutes)
+        if scaled_eta_minutes is not None
+        else None
+    )
 
     with st.container():
         st.markdown('<div class="glass-shell">', unsafe_allow_html=True)
-        chip_eta = _format_hhmm(eta_dt) if eta_dt is not None else "Pending"
-        st.markdown(
-            f'<div style="text-align:center;"><span class="status-chip">Estimated Arrival Time (ETA): {chip_eta}</span></div>',
-            unsafe_allow_html=True,
-        )
 
-        cols = st.columns(4)
-        with cols[0]:
-            _metric_card("Device Time", current_device_dt.strftime("%H:%M"))
-        with cols[1]:
-            _metric_card("Scheduled Departure", _format_hhmm(scheduled_departure_dt))
-        with cols[2]:
-            _metric_card("Predictive Travel Time", _format_minutes(predictive_minutes))
-        with cols[3]:
-            _metric_card("Estimated Arrival Time", _format_hhmm(eta_dt))
-
-        if improvement_pct is not None:
-            imp_color = "#16c784" if improvement_pct >= 0 else "#ff5a5a"
-            st.markdown(
-                f'<div style="text-align:center; margin-top:0.6rem; font-weight:700; color:{imp_color};">'
-                f'📊 Route Improvement: {improvement_pct:.2f}%'
-                "</div>",
-                unsafe_allow_html=True,
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("\U0001F552 Departure Time", _format_ampm(departure_dt))
+        with c2:
+            st.metric("\U0001F552 Arrival Time", _format_ampm(arrival_dt))
+        with c3:
+            st.metric("\u23F3 ETA", _format_eta_readable(predictive_minutes))
+        with c4:
+            st.metric(
+                "\U0001F6E1 Reliability",
+                "--" if reliability_score is None else f"{float(reliability_score):.1f}%",
             )
-
-        if static_path is not None and predictive_path is not None and predicted_speeds is not None:
-            node_speeds = _node_speed_vector(np.asarray(predicted_speeds))
-            avg_speed = _average_route_speed(predictive_path, node_speeds)
-            congestion_text, congestion_color = _congestion_level(avg_speed)
-            time_saved_text = _human_time_saved(static_minutes, predictive_minutes)
-            bottlenecks = _top_bottlenecks(predictive_path, node_speeds, top_k=2)
-            stability_text, stability_color = _route_stability(static_path, predictive_path)
-            confidence_horizon, confidence_score = _confidence_by_horizon(travel_after_min)
-
-            st.markdown(
-                '<div style="text-align:center; margin:0.8rem 0 0.5rem; font-size:1.08rem; font-weight:800;">'
-                "🚑 Advanced Route Intelligence"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-
-            a1, a2, a3, a4 = st.columns(4)
-            with a1:
-                badge = (
-                    f'<span class="badge" style="background:{congestion_color}20; color:{congestion_color}; '
-                    f'border:1px solid {congestion_color}66;">{congestion_text}</span>'
-                )
-                speed_text = "--" if avg_speed is None else f"{avg_speed:.2f}"
-                _analytics_card("⚠ Congestion Level", f"{badge}<br/><span style='font-size:0.95rem;'>Avg Speed: {speed_text}</span>")
-            with a2:
-                _analytics_card("⏱ Time Saved", f"<span style='font-size:1.35rem;'>{time_saved_text}</span>")
-            with a3:
-                _analytics_card("📊 Route Stability", f"<span style='color:{stability_color};'>{stability_text}</span>")
-            with a4:
-                _analytics_card("🚑 AI Confidence", f"{confidence_score}%<br/><span style='font-size:0.88rem;'>{confidence_horizon}</span>")
-                st.progress(confidence_score / 100.0)
-
-            st.markdown("#### Critical Segments")
-            if bottlenecks:
-                for u, v, seg_speed in bottlenecks:
-                    st.markdown(
-                        f"- `Node {u} -> Node {v}` | Predicted speed: `{seg_speed:.2f}`",
-                    )
-            else:
-                st.markdown("- No critical segments identified.")
 
         st.markdown('<div class="viz-title">Route Visualization</div>', unsafe_allow_html=True)
 
@@ -638,12 +684,13 @@ def _route_optimizer_page() -> None:
                 predictive_path=predictive_path,
                 start_node=int(start_node),
                 end_node=int(end_node),
+                node_uncertainty_norm=node_uncertainty_norm,
+                show_risk_layer=bool(show_risk_layer),
             )
         else:
-            st.info("Configure inputs from the sidebar and click 'Optimize Route' to generate emergency route intelligence.")
+            st.info("Configure start/end and click 'Optimize Route' to render the route.")
 
         st.markdown("</div>", unsafe_allow_html=True)
-
 
 def main() -> None:
     st.set_page_config(page_title="AmbuNav - AI Emergency Route Optimizer", layout="wide")
@@ -661,3 +708,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

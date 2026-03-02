@@ -8,6 +8,9 @@ import networkx as nx
 import numpy as np
 
 
+DEFAULT_UNCERTAINTY_PATH = Path("node_uncertainty.npy")
+
+
 def load_adjacency_matrix(adj_path: str | Path = "data/raw/adj_METR-LA.pkl") -> np.ndarray:
     """Load adjacency matrix from METR-LA pickle."""
     path = Path(adj_path)
@@ -28,6 +31,56 @@ def load_adjacency_matrix(adj_path: str | Path = "data/raw/adj_METR-LA.pkl") -> 
         raise ValueError(msg)
 
     return adjacency
+
+
+def load_node_uncertainty(
+    uncertainty_path: str | Path = DEFAULT_UNCERTAINTY_PATH,
+    expected_nodes: int | None = None,
+) -> np.ndarray:
+    path = Path(uncertainty_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Node uncertainty file not found: {path}")
+
+    node_uncertainty = np.asarray(np.load(path), dtype=np.float32).reshape(-1)
+    if node_uncertainty.size == 0:
+        raise ValueError("Loaded node uncertainty is empty.")
+
+    if expected_nodes is not None and node_uncertainty.shape[0] != expected_nodes:
+        msg = (
+            f"Expected node uncertainty length {expected_nodes}, "
+            f"got {node_uncertainty.shape[0]}"
+        )
+        raise ValueError(msg)
+
+    return node_uncertainty
+
+
+def normalize_node_uncertainty(node_uncertainty: np.ndarray | Iterable[float]) -> np.ndarray:
+    uncertainty = np.asarray(node_uncertainty, dtype=np.float32).reshape(-1)
+    if uncertainty.size == 0:
+        raise ValueError("node_uncertainty is empty.")
+
+    unc_min = float(np.min(uncertainty))
+    unc_max = float(np.max(uncertainty))
+    if np.isclose(unc_max, unc_min):
+        return np.zeros_like(uncertainty, dtype=np.float32)
+
+    normalized = (uncertainty - unc_min) / (unc_max - unc_min)
+    return np.clip(normalized.astype(np.float32), 0.0, 1.0)
+
+
+def _resolve_normalized_uncertainty(
+    node_uncertainty: np.ndarray | Iterable[float] | None,
+    num_nodes: int,
+) -> np.ndarray:
+    if node_uncertainty is None:
+        return np.zeros(num_nodes, dtype=np.float32)
+
+    normalized = normalize_node_uncertainty(node_uncertainty)
+    if normalized.shape[0] != num_nodes:
+        msg = f"Expected {num_nodes} uncertainty values, got {normalized.shape[0]}"
+        raise ValueError(msg)
+    return normalized
 
 
 def build_sensor_graph(adjacency: np.ndarray) -> nx.DiGraph:
@@ -102,6 +155,8 @@ def get_optimized_path(
     start_node: int,
     end_node: int,
     predicted_speeds: np.ndarray | Iterable[float],
+    node_uncertainty: np.ndarray | Iterable[float] | None = None,
+    lambda_value: float = 0.3,
     adj_path: str | Path = "data/raw/adj_METR-LA.pkl",
     allow_undirected_fallback: bool = True,
 ) -> tuple[list[int], float]:
@@ -110,14 +165,56 @@ def get_optimized_path(
 
     travel_time = distance / predicted_speed
     """
+    path, _, risk_adjusted_cost = get_optimized_path_detailed(
+        start_node=start_node,
+        end_node=end_node,
+        predicted_speeds=predicted_speeds,
+        node_uncertainty=node_uncertainty,
+        lambda_value=lambda_value,
+        adj_path=adj_path,
+        allow_undirected_fallback=allow_undirected_fallback,
+    )
+    return path, risk_adjusted_cost
+
+
+def get_optimized_path_detailed(
+    start_node: int,
+    end_node: int,
+    predicted_speeds: np.ndarray | Iterable[float],
+    node_uncertainty: np.ndarray | Iterable[float] | None = None,
+    lambda_value: float = 0.3,
+    adj_path: str | Path = "data/raw/adj_METR-LA.pkl",
+    allow_undirected_fallback: bool = True,
+) -> tuple[list[int], float, float]:
+    """
+    Returns:
+    - path
+    - physical_travel_time (distance/speed only)
+    - risk_adjusted_cost (cost used by routing)
+    """
     adjacency = load_adjacency_matrix(adj_path)
     graph = build_sensor_graph(adjacency)
     node_speeds = _to_node_speed_vector(predicted_speeds, num_nodes=adjacency.shape[0])
+    node_uncertainty_norm = _resolve_normalized_uncertainty(
+        node_uncertainty=node_uncertainty,
+        num_nodes=adjacency.shape[0],
+    )
 
-    def dynamic_weight(u: int, v: int, edge_data: dict[str, float]) -> float:
+    if lambda_value < 0:
+        raise ValueError("lambda_value must be >= 0.")
+
+    def physical_weight(u: int, v: int, edge_data: dict[str, float]) -> float:
         distance = float(edge_data["distance"])
         speed = float((node_speeds[u] + node_speeds[v]) * 0.5)
         return distance / speed
+
+    def dynamic_weight(u: int, v: int, edge_data: dict[str, float]) -> float:
+        travel_time = physical_weight(u, v, edge_data)
+        uncertainty = float((node_uncertainty_norm[u] + node_uncertainty_norm[v]) * 0.5)
+        risk_gain = 0.8
+        max_penalty_ratio = 0.35
+        penalty_ratio = min(lambda_value * uncertainty * risk_gain, max_penalty_ratio)
+        return travel_time * (1.0 + penalty_ratio)
 
     try:
         path, routing_graph = _astar_with_optional_undirected_fallback(
@@ -132,11 +229,69 @@ def get_optimized_path(
     except nx.NetworkXNoPath as exc:
         raise ValueError(f"No path found between nodes {start_node} and {end_node}.") from exc
 
-    total_travel_time = 0.0
+    physical_travel_time = 0.0
+    risk_adjusted_cost = 0.0
     for u, v in zip(path[:-1], path[1:]):
-        total_travel_time += dynamic_weight(u, v, routing_graph[u][v])
+        edge_data = routing_graph[u][v]
+        physical_travel_time += physical_weight(u, v, edge_data)
+        risk_adjusted_cost += dynamic_weight(u, v, edge_data)
 
-    return path, total_travel_time
+    return path, physical_travel_time, risk_adjusted_cost
+
+
+def compute_route_reliability(
+    path: list[int],
+    node_uncertainty: np.ndarray | Iterable[float],
+    adj_path: str | Path = "data/raw/adj_METR-LA.pkl",
+    clip_percentile: float = 95.0,
+) -> tuple[float, float, str]:
+    """
+    Returns:
+    - avg_uncertainty in [0, 1]
+    - reliability_score in [0, 100]
+    - risk label: Low / Medium / High
+    """
+    normalized_uncertainty = normalize_node_uncertainty(node_uncertainty)
+    if not 0.0 < clip_percentile <= 100.0:
+        raise ValueError("clip_percentile must be in (0, 100].")
+
+    clip_value = float(np.percentile(normalized_uncertainty, clip_percentile))
+    clipped_uncertainty = np.minimum(normalized_uncertainty, clip_value)
+    if clip_value > 0:
+        clipped_uncertainty = np.clip(clipped_uncertainty / clip_value, 0.0, 1.0)
+
+    if not path:
+        return 1.0, 0.0, "High"
+
+    if len(path) == 1:
+        avg_unc = float(clipped_uncertainty[int(path[0])])
+    else:
+        adjacency = load_adjacency_matrix(adj_path)
+        weighted_unc_sum = 0.0
+        weighted_distance_sum = 0.0
+        for u, v in zip(path[:-1], path[1:]):
+            distance = float(adjacency[int(u), int(v)])
+            if distance <= 0:
+                distance = float(adjacency[int(v), int(u)])
+            if distance <= 0:
+                distance = 1.0
+            edge_unc = float((clipped_uncertainty[int(u)] + clipped_uncertainty[int(v)]) * 0.5)
+            weighted_unc_sum += edge_unc * distance
+            weighted_distance_sum += distance
+        avg_unc = float(weighted_unc_sum / max(weighted_distance_sum, 1e-8))
+
+    # Softer calibrated mapping: keeps score in [0, 100] but avoids overly harsh drops.
+    alpha = 0.65
+    reliability_score = float(np.clip(100.0 * np.exp(-alpha * avg_unc), 0.0, 100.0))
+
+    if avg_unc < 0.3:
+        risk_level = "Low"
+    elif avg_unc < 0.6:
+        risk_level = "Medium"
+    else:
+        risk_level = "High"
+
+    return avg_unc, reliability_score, risk_level
 
 
 def get_static_path(
@@ -185,6 +340,8 @@ def compare_static_vs_predictive(
     start_node: int,
     end_node: int,
     predicted_speeds: np.ndarray | Iterable[float],
+    node_uncertainty: np.ndarray | Iterable[float] | None = None,
+    lambda_value: float = 0.3,
     adj_path: str | Path = "data/raw/adj_METR-LA.pkl",
     constant_speed: float = 40.0,
 ) -> tuple[tuple[list[int], float], tuple[list[int], float], float]:
@@ -206,6 +363,8 @@ def compare_static_vs_predictive(
         start_node=start_node,
         end_node=end_node,
         predicted_speeds=predicted_speeds,
+        node_uncertainty=node_uncertainty,
+        lambda_value=lambda_value,
         adj_path=adj_path,
     )
 
