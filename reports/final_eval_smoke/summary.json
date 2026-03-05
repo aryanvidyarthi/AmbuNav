@@ -1,0 +1,32 @@
+{
+  "metadata": {
+    "seed": 42,
+    "n_pairs": 10,
+    "batch_size": 64,
+    "lambdas": [
+      0.0,
+      0.3
+    ],
+    "git_commit": "915f498"
+  },
+  "forecast_metrics": {
+    "5min": {
+      "MAE": 2.94655768189516,
+      "RMSE": 6.352309415233047,
+      "MAPE": 6.627602275470735
+    },
+    "10min": {
+      "MAE": 3.571384039577518,
+      "RMSE": 7.986437012881365,
+      "MAPE": 7.9638991884334365
+    },
+    "15min": {
+      "MAE": 4.3643229763262115,
+      "RMSE": 9.12146095959193,
+      "MAPE": 9.41408613371391
+    }
+  },
+  "best_lambda_by_risk_improvement": 0.0,
+  "best_lambda_by_physical_improvement": 0.0,
+  "best_lambda_by_reliability": 0.3
+}

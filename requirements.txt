@@ -6,7 +6,6 @@ networkx>=3.2.0
 
 # Deep Learning / Forecasting (Graph WaveNet)
 torch>=2.1.0
-torch-geometric>=2.4.0
 
 # Routing and optimization
 heapdict>=1.0.1

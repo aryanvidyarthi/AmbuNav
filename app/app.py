@@ -19,6 +19,7 @@ if str(PAGES_DIR) not in sys.path:
     sys.path.insert(0, str(PAGES_DIR))
 
 from Analysis import render_analysis_page
+from src.deploy.artifacts import ensure_artifacts
 from src.inference import run_inference
 from src.routing import dynamic_astar as routing_dynamic_astar
 
@@ -692,9 +693,41 @@ def _route_optimizer_page() -> None:
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+
+@st.cache_resource(show_spinner=False)
+def _ensure_deploy_artifacts() -> dict[str, list[str]]:
+    extra_urls: dict[str, str] = {}
+    try:
+        for key in (
+            "AMBUNAV_MODEL_URL",
+            "AMBUNAV_METR_H5_URL",
+            "AMBUNAV_ADJ_URL",
+            "AMBUNAV_UNCERTAINTY_URL",
+        ):
+            value = st.secrets.get(key, "")
+            if value:
+                extra_urls[key] = str(value)
+    except Exception:
+        # No secrets configured; fallback to environment variables.
+        pass
+    return ensure_artifacts(extra_urls=extra_urls)
+
 def main() -> None:
     st.set_page_config(page_title="AmbuNav - AI Emergency Route Optimizer", layout="wide")
     _inject_styles()
+    artifact_status = _ensure_deploy_artifacts()
+    if artifact_status["missing_required"]:
+        st.error(
+            "Missing required artifacts. Set Streamlit secrets or environment variables for: "
+            + ", ".join(artifact_status["missing_required"])
+        )
+        st.info(
+            "Required keys: AMBUNAV_MODEL_URL, AMBUNAV_METR_H5_URL, AMBUNAV_ADJ_URL. "
+            "Optional: AMBUNAV_UNCERTAINTY_URL."
+        )
+        return
+    if artifact_status["downloaded"]:
+        st.caption("Downloaded artifacts: " + ", ".join(artifact_status["downloaded"]))
 
     with st.sidebar:
         page = st.radio("Navigation", ["Emergency Optimizer", "Forecasting Analysis"])

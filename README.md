@@ -133,3 +133,28 @@ pip install -r requirements.txt
 2. Implement time-dependent Dynamic A* in `src/routing/algorithms/dynamic_astar.py`
 3. Wire prediction + routing into `src/ui/app.py` Streamlit workflows
 4. Add reproducible experiments under `docs/experiments/`
+
+## Deployment (Streamlit Community Cloud)
+
+Set app entrypoint to:
+
+```text
+app/app.py
+```
+
+Required secrets (or environment variables):
+
+```text
+AMBUNAV_MODEL_URL
+AMBUNAV_METR_H5_URL
+AMBUNAV_ADJ_URL
+```
+
+Optional:
+
+```text
+AMBUNAV_UNCERTAINTY_URL
+```
+
+The app auto-downloads missing artifacts on startup.  
+If any required artifact URL is missing, the app shows an actionable error message.

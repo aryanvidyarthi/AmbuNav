@@ -1,0 +1,3 @@
+lambda,risk_mean_improvement_pct,risk_median_improvement_pct,risk_positive_rate_pct,physical_mean_improvement_pct,physical_median_improvement_pct,physical_positive_rate_pct,avg_reliability_pct
+0.0,34.25011684001042,35.415016247117705,100.0,34.25011684001042,35.415016247117705,100.0,65.75232927517163
+0.3,28.66613511647128,29.855314213914344,100.0,34.202351677928604,35.415016247117705,100.0,65.75729717063537

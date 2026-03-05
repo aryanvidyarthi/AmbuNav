@@ -1,0 +1,7 @@
+import pandas as pd
+
+df = pd.read_hdf("data/raw/METR-LA.h5")
+
+print(df.shape)
+print(df.head())
+print(df.index[:10])
